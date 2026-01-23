@@ -1,0 +1,379 @@
+import time
+import random
+import os
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+
+# --- Configuration ---
+EMAIL = os.getenv("EMAIL", "your_email@example.com")
+PASSWORD = os.getenv("PASSWORD", "your_password")
+TARGET_CLASSES = [
+    "Reformer Pilates"
+]
+LOGIN_URL = "https://my.nuffieldhealth.com/"
+TARGET_URL = os.getenv("TARGET_URL", "https://my.nuffieldhealth.com/timetable")
+BOOKING_TIMEOUT_SECONDS = 120  # How long to keep trying to book classes
+
+# --- Setup Driver ---
+chrome_options = Options()
+chrome_options.add_argument("--headless")  # Run without a window for automation
+chrome_options.add_argument("--window-size=1920,1080")
+chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")  # For GitHub Actions
+
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
+def quick_delay(min_sec=0.3, max_sec=0.8):
+    """Short delay for automation speed."""
+    time.sleep(random.uniform(min_sec, max_sec))
+
+def handle_login():
+    try:
+        print("Checking for login fields...")
+        wait = WebDriverWait(driver, 4)
+        email_field = wait.until(EC.presence_of_element_located((By.ID, "email")))
+        pass_field = driver.find_element(By.ID, "password")
+        next_btn = driver.find_element(By.ID, "next")
+
+        email_field.send_keys(EMAIL)
+        pass_field.send_keys(PASSWORD)
+        next_btn.click()
+        print("Login submitted.")
+    except Exception as e:
+        print("Login fields not found or already logged in.")
+
+def handle_parent_page():
+    """Accept cookies if the banner is present."""
+    try:
+        wait = WebDriverWait(driver, 3)
+        cookie_btn = wait.until(EC.element_to_be_clickable((By.ID, "ccc-notify-accept")))
+        cookie_btn.click()
+        print("Cookies accepted.")
+    except:
+        print("No cookie banner found or already accepted.")
+
+def click_login_button():
+    """Clicks the 'Log in' button inside the booking iframe."""
+    try:
+        print("Waiting for booking iframe...")
+        wait = WebDriverWait(driver, 15)
+        iframe = wait.until(EC.presence_of_element_located((By.XPATH, "//iframe[contains(@src, 'nh-booking-microsite')]")))
+        driver.switch_to.frame(iframe)
+        print("Switched to booking iframe.")
+
+        # Click the first "Log in" button
+        login_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.primary-btn.m--logged_out")))
+        print("Clicking 'Log in' button...")
+        quick_delay()
+        login_btn.click()
+        
+        # Switch back to main content for login form
+        driver.switch_to.default_content()
+        time.sleep(1)
+    except Exception as e:
+        print(f"Could not click login button: {e}")
+        driver.switch_to.default_content()
+
+def monitor_booking_result():
+    """Handles the 'Done' success modal or the 'Timeout' error modal."""
+    start_time = time.time()
+    while (time.time() - start_time) < 10:
+        # 1. Check for Timeout Modal
+        try:
+            timeout_modal = driver.find_elements(By.CLASS_NAME, "modal-subtitle")
+            if timeout_modal and "Connection timed out" in timeout_modal[0].text:
+                ok_btn = driver.find_element(By.CSS_SELECTOR, ".modal-button.modal-cta__button")
+                print("Timeout detected. Clicking OK...")
+                quick_delay()
+                ok_btn.click()
+                return "timeout"
+        except:
+            pass
+
+        # 2. Check for Done Button (Success)
+        try:
+            done_btn = driver.find_elements(By.CSS_SELECTOR, "button.modal-outline__button")
+            if done_btn and "Done" in done_btn[0].text:
+                print("Booking successful! Clicking Done.")
+                quick_delay()
+                done_btn[0].click()
+                time.sleep(0.5)
+                return "success"
+        except:
+            pass
+        
+        time.sleep(0.3)
+    return "not_found"
+
+def select_last_date():
+    """Selects the last date in the list if available and not already active."""
+    try:
+        date_btns = driver.find_elements(By.CLASS_NAME, "day-toggle__button")
+        if not date_btns:
+            return False
+        
+        last_date = date_btns[-1]
+        class_attr = last_date.get_attribute("class") or ""
+        
+        if "m--active" not in class_attr:
+            print(f"Selecting date: {last_date.text.strip()}")
+            last_date.click()
+        return True
+    except:
+        return False
+
+def refresh_and_switch_to_iframe():
+    """Refreshes the page and switches back to the booking iframe."""
+    print("Refreshing page...")
+    driver.switch_to.default_content()
+    driver.refresh()
+    time.sleep(1)
+    
+    # Re-enter the iframe
+    wait = WebDriverWait(driver, 15)
+    iframe = wait.until(EC.presence_of_element_located((By.XPATH, "//iframe[contains(@src, 'nh-booking-microsite')]")))
+    driver.switch_to.frame(iframe)
+    time.sleep(0.5)
+    
+    # Immediately select last date after refresh
+    select_last_date()
+
+def start_continuous_booking():
+    """Continuously try to book classes for BOOKING_TIMEOUT_SECONDS."""
+    start_time = time.time()
+    cycle = 0
+    booked_classes = []
+    failed_classes = set()  # Track classes that failed twice
+    
+    while (time.time() - start_time) < BOOKING_TIMEOUT_SECONDS:
+        cycle += 1
+        elapsed = int(time.time() - start_time)
+        print(f"[{elapsed}s] Scan cycle {cycle}: Checking for last date...")
+        
+        # Try to select last date
+        if not select_last_date():
+            print("Last date not available yet, refreshing...")
+            time.sleep(random.uniform(0.3, 1))
+            refresh_and_switch_to_iframe()
+            continue
+        
+        print("Searching for matching classes...")
+        
+        try:
+            # Wait for class list to load
+            wait = WebDriverWait(driver, 5)
+            wait.until(EC.presence_of_element_located((By.CLASS_NAME, "class-content__wrapper")))
+            rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
+            
+            # Check if any matching classes exist (bookable or not)
+            matching_classes_exist = False
+            bookable_classes_exist = False
+            
+            for idx, row in enumerate(rows):
+                title_el = row.find_element(By.CLASS_NAME, "class-title")
+                title_text = title_el.text.strip()
+                
+                # Check if title matches targets
+                if any(target.lower() in title_text.lower() for target in TARGET_CLASSES):
+                    matching_classes_exist = True
+                    
+                    # Create unique identifier for this specific class instance
+                    try:
+                        time_el = row.find_element(By.CLASS_NAME, "class-time")
+                        class_id = f"{title_text}|{time_el.text.strip()}"
+                    except:
+                        class_id = f"{title_text}|{idx}"
+                    
+                    # Skip if already booked or failed this specific instance
+                    if class_id in booked_classes or class_id in failed_classes:
+                        continue
+                    
+                    # Try to find Book button first
+                    book_btn = None
+                    waitlist_btn = None
+                    leave_waitlist_btn = None
+                    cancel_booking_btn = None
+                    
+                    # Check for already booked/waitlisted states first
+                    try:
+                        leave_waitlist_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--leave_waitlist")
+                        print(f"[ALREADY ON WAITLIST] {title_text}")
+                        booked_classes.append(class_id)
+                        continue
+                    except:
+                        pass
+                    
+                    try:
+                        cancel_booking_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--cancel_booking")
+                        print(f"[ALREADY BOOKED] {title_text}")
+                        booked_classes.append(class_id)
+                        continue
+                    except:
+                        pass
+                    
+                    # Now check for available booking options
+                    try:
+                        book_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--book:not([disabled])")
+                    except:
+                        # No book button, try waitlist
+                        try:
+                            waitlist_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--join_waitlist:not([disabled])")
+                        except:
+                            pass
+                    
+                    if book_btn:
+                        # Book button available
+                        bookable_classes_exist = True
+                        print(f"[BOOKING] {title_text}")
+                        quick_delay()
+                        book_btn.click()
+                        
+                        result = monitor_booking_result()
+                        
+                        if result == "success":
+                            booked_classes.append(class_id)
+                            print(f"[SUCCESS] Booked: {title_text}")
+                        elif result == "timeout":
+                            # First timeout - try once more
+                            print(f"[RETRY] Attempting {title_text} again...")
+                            quick_delay()
+                            # Need to re-find element after modal
+                            rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
+                            if idx < len(rows):
+                                row = rows[idx]
+                                try:
+                                    book_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--book:not([disabled])")
+                                    book_btn.click()
+                                    
+                                    result2 = monitor_booking_result()
+                                    if result2 == "success":
+                                        booked_classes.append(class_id)
+                                        print(f"[SUCCESS] Booked: {title_text} on retry")
+                                    else:
+                                        # Second failure - skip this class
+                                        failed_classes.add(class_id)
+                                        print(f"[SKIPPED] {title_text} - Failed twice, moving on")
+                                except:
+                                    failed_classes.add(class_id)
+                                    print(f"[SKIPPED] {title_text} - Could not retry")
+                            else:
+                                failed_classes.add(class_id)
+                                print(f"[SKIPPED] {title_text} - Could not retry")
+                        
+                    elif waitlist_btn:
+                        # Waitlist button available - join it
+                        bookable_classes_exist = True
+                        print(f"[WAITLIST] Joining waitlist for {title_text}")
+                        quick_delay()
+                        waitlist_btn.click()
+                        
+                        result = monitor_booking_result()
+                        
+                        if result == "success":
+                            booked_classes.append(class_id)
+                            print(f"[SUCCESS] Joined waitlist: {title_text}")
+                        elif result == "timeout":
+                            # First timeout - try once more
+                            print(f"[RETRY] Attempting waitlist for {title_text} again...")
+                            quick_delay()
+                            rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
+                            if idx < len(rows):
+                                row = rows[idx]
+                                try:
+                                    waitlist_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--join_waitlist:not([disabled])")
+                                    waitlist_btn.click()
+                                    
+                                    result2 = monitor_booking_result()
+                                    if result2 == "success":
+                                        booked_classes.append(class_id)
+                                        print(f"[SUCCESS] Joined waitlist: {title_text} on retry")
+                                    else:
+                                        failed_classes.add(class_id)
+                                        print(f"[SKIPPED] {title_text} - Waitlist failed twice")
+                                except:
+                                    failed_classes.add(class_id)
+                                    print(f"[SKIPPED] {title_text} - Could not retry waitlist")
+                            else:
+                                failed_classes.add(class_id)
+                                print(f"[SKIPPED] {title_text} - Could not retry waitlist")
+                    else:
+                        # No button available
+                        continue
+
+            if not matching_classes_exist:
+                # No matching classes found at all, refresh and try again
+                print("No matching classes found on last date, refreshing...")
+                time.sleep(random.uniform(0.3, 1))
+                refresh_and_switch_to_iframe()
+            elif not bookable_classes_exist:
+                # Matching classes exist but none are bookable
+                print("All matching classes already booked or failed. Session complete.")
+                break
+                
+        except Exception as e:
+            print(f"Error during scan: {e}")
+            time.sleep(1)
+    
+    print(f"\n=== Booking session complete ===")
+    print(f"Total time: {int(time.time() - start_time)}s")
+    print(f"\nClasses successfully booked/waitlisted: {len(booked_classes)}")
+    if booked_classes:
+        for c in booked_classes:
+            print(f"  ✓ {c}")
+    else:
+        print("  (none)")
+    
+    print(f"\nClasses skipped/failed: {len(failed_classes)}")
+    if failed_classes:
+        for c in failed_classes:
+            print(f"  ✗ {c}")
+    else:
+        print("  (none)")
+
+def main():
+    print(f"=== Nuffield Booker Started at {time.strftime('%H:%M:%S')} ===")
+    try:
+        # --- Step 1: Login at my.nuffieldhealth.com ---
+        print(f"Navigating to login page: {LOGIN_URL}")
+        driver.get(LOGIN_URL)
+        time.sleep(1)
+        
+        # Accept cookies on login page if present
+        handle_parent_page()
+        
+        # Handle login form
+        handle_login()
+        time.sleep(1)
+        
+        # --- Step 2: Navigate to timetable ---
+        print(f"Navigating to timetable: {TARGET_URL}")
+        driver.get(TARGET_URL)
+        time.sleep(1)
+        
+        # Accept cookies on timetable page if needed
+        handle_parent_page()
+
+        # --- Switch to Iframe ---
+        print("Waiting for booking iframe...")
+        wait = WebDriverWait(driver, 15)
+        iframe = wait.until(EC.presence_of_element_located((By.XPATH, "//iframe[contains(@src, 'nh-booking-microsite')]")))
+        driver.switch_to.frame(iframe)
+        print("Switched to booking iframe.")
+
+        # Wait for date buttons to be available
+        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "day-toggle__button")))
+
+        start_continuous_booking()
+
+    finally:
+        driver.quit()
+
+if __name__ == "__main__":
+    main()

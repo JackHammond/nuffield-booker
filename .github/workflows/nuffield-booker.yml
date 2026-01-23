@@ -1,0 +1,36 @@
+name: Nuffield Booker
+
+on:
+  schedule:
+    - cron: '59 6 * * *'  # Runs at 6:59 AM UTC daily (adjust for your timezone)
+  workflow_dispatch:  # Allows manual trigger from GitHub Actions tab
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install Chrome
+      run: |
+        wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+        sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+        sudo apt-get update
+        sudo apt-get install -y google-chrome-stable
+    
+    - name: Install Python dependencies
+      run: |
+        pip install selenium webdriver-manager
+    
+    - name: Run booking script
+      env:
+        EMAIL: ${{ secrets.NUFFIELD_EMAIL }}
+        PASSWORD: ${{ secrets.NUFFIELD_PASSWORD }}
+      run: python nuffieldbooker.py
