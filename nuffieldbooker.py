@@ -16,7 +16,7 @@ TARGET_CLASSES = [
     "Reformer Pilates"
 ]
 LOGIN_URL = "https://my.nuffieldhealth.com/"
-TARGET_URL = os.getenv("TARGET_URL", "https://my.nuffieldhealth.com/timetable")
+TARGET_URL = os.getenv("TARGET_URL", "https://www.nuffieldhealth.com/gyms/cambridge/timetable")
 BOOKING_TIMEOUT_SECONDS = 120  # How long to keep trying to book classes
 
 # --- Setup Driver ---
