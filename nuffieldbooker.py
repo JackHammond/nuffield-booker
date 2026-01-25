@@ -140,13 +140,11 @@ def refresh_and_switch_to_iframe():
     print("Refreshing page...")
     driver.switch_to.default_content()
     driver.refresh()
-    time.sleep(1)
     
-    # Re-enter the iframe
+    # Re-enter the iframe (wait handles the timing)
     wait = WebDriverWait(driver, 15)
     iframe = wait.until(EC.presence_of_element_located((By.XPATH, "//iframe[contains(@src, 'nh-booking-microsite')]")))
     driver.switch_to.frame(iframe)
-    time.sleep(0.5)
     
     # Immediately select last date after refresh
     select_last_date()
@@ -368,8 +366,6 @@ def start_continuous_booking():
             if not matching_classes_exist:
                 # No matching classes found at all, refresh and try again
                 print(f"❌ None found")
-                print("Refreshing...")
-                time.sleep(random.uniform(0.3, 1))
                 refresh_and_switch_to_iframe()
             elif not bookable_classes_exist:
                 # Matching classes exist but none are bookable
