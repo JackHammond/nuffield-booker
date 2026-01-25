@@ -26,7 +26,7 @@ BOOKING_TIMEOUT_SECONDS = 120  # How long to keep trying to book classes
 
 # --- Setup Driver ---
 chrome_options = Options()
-#chrome_options.add_argument("--headless")  # Run without a window for automation
+chrome_options.add_argument("--headless")  # Run without a window for automation
 chrome_options.add_argument("--window-size=1920,1080")
 chrome_options.add_argument("--disable-blink-features=AutomationControlled")
 chrome_options.add_argument("--disable-gpu")
