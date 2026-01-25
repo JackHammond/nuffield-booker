@@ -1,6 +1,8 @@
 import time
 import random
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -9,11 +11,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
+# Load environment variables from .env file
+load_dotenv()
+
 # --- Configuration ---
 EMAIL = os.getenv("EMAIL", "your_email@example.com")
 PASSWORD = os.getenv("PASSWORD", "your_password")
 TARGET_CLASSES = [
-    "Reformer Pilates"
+    "dddd"
 ]
 LOGIN_URL = "https://my.nuffieldhealth.com/"
 TARGET_URL = os.getenv("TARGET_URL", "https://www.nuffieldhealth.com/gyms/cambridge/timetable")
@@ -21,7 +26,7 @@ BOOKING_TIMEOUT_SECONDS = 120  # How long to keep trying to book classes
 
 # --- Setup Driver ---
 chrome_options = Options()
-chrome_options.add_argument("--headless")  # Run without a window for automation
+#chrome_options.add_argument("--headless")  # Run without a window for automation
 chrome_options.add_argument("--window-size=1920,1080")
 chrome_options.add_argument("--disable-blink-features=AutomationControlled")
 chrome_options.add_argument("--disable-gpu")
@@ -52,10 +57,11 @@ def handle_login():
 def handle_parent_page():
     """Accept cookies if the banner is present."""
     try:
-        wait = WebDriverWait(driver, 3)
+        wait = WebDriverWait(driver, 5)
         cookie_btn = wait.until(EC.element_to_be_clickable((By.ID, "ccc-notify-accept")))
         cookie_btn.click()
-        print("Cookies accepted.")
+        print("✓ Cookies accepted.")
+        time.sleep(0.5)  # Brief pause after accepting cookies
     except:
         print("No cookie banner found or already accepted.")
 
@@ -152,10 +158,15 @@ def start_continuous_booking():
     booked_classes = []
     failed_classes = set()  # Track classes that failed twice
     
+    print(f"\n=== Target classes: {', '.join(TARGET_CLASSES)} ===")
+    print(f"=== Running for {BOOKING_TIMEOUT_SECONDS} seconds ===")
+    
     while (time.time() - start_time) < BOOKING_TIMEOUT_SECONDS:
         cycle += 1
         elapsed = int(time.time() - start_time)
-        print(f"[{elapsed}s] Scan cycle {cycle}: Checking for last date...")
+        remaining = BOOKING_TIMEOUT_SECONDS - elapsed
+        print(f"\n[{elapsed}s / {BOOKING_TIMEOUT_SECONDS}s] === Scan cycle {cycle} | {remaining}s remaining ===")
+        print(f"Checking for last date...")
         
         # Try to select last date
         if not select_last_date():
@@ -170,151 +181,199 @@ def start_continuous_booking():
             # Wait for class list to load
             wait = WebDriverWait(driver, 5)
             wait.until(EC.presence_of_element_located((By.CLASS_NAME, "class-content__wrapper")))
+            
+            # Refresh rows each iteration to avoid stale elements
             rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
             
-            # Check if any matching classes exist (bookable or not)
-            matching_classes_exist = False
-            bookable_classes_exist = False
+            print(f"Found {len(rows)} total classes on page")
+            print(f"Looking for: {', '.join(TARGET_CLASSES)}")
+            
+            # First pass: identify all matching classes
+            matching_classes_info = []
             
             for idx, row in enumerate(rows):
-                title_el = row.find_element(By.CLASS_NAME, "class-title")
-                title_text = title_el.text.strip()
-                
-                # Check if title matches targets
-                if any(target.lower() in title_text.lower() for target in TARGET_CLASSES):
-                    matching_classes_exist = True
+                try:
+                    title_el = row.find_element(By.CLASS_NAME, "class-title")
+                    title_text = title_el.text.strip()
                     
-                    # Create unique identifier for this specific class instance
-                    try:
-                        time_el = row.find_element(By.CLASS_NAME, "class-time")
-                        class_id = f"{title_text}|{time_el.text.strip()}"
-                    except:
-                        class_id = f"{title_text}|{idx}"
-                    
-                    # Skip if already booked or failed this specific instance
-                    if class_id in booked_classes or class_id in failed_classes:
-                        continue
-                    
-                    # Try to find Book button first
-                    book_btn = None
-                    waitlist_btn = None
-                    leave_waitlist_btn = None
-                    cancel_booking_btn = None
-                    
-                    # Check for already booked/waitlisted states first
-                    try:
-                        leave_waitlist_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--leave_waitlist")
-                        print(f"[ALREADY ON WAITLIST] {title_text}")
-                        booked_classes.append(class_id)
-                        continue
-                    except:
-                        pass
-                    
-                    try:
-                        cancel_booking_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--cancel_booking")
-                        print(f"[ALREADY BOOKED] {title_text}")
-                        booked_classes.append(class_id)
-                        continue
-                    except:
-                        pass
-                    
-                    # Now check for available booking options
-                    try:
-                        book_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--book:not([disabled])")
-                    except:
-                        # No book button, try waitlist
+                    # Check if title matches targets
+                    if any(target.lower() in title_text.lower() for target in TARGET_CLASSES):
                         try:
-                            waitlist_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--join_waitlist:not([disabled])")
+                            time_el = row.find_element(By.CLASS_NAME, "class-time")
+                            time_text = time_el.text.strip()
+                            class_id = f"{title_text}|{time_text}"
                         except:
-                            pass
+                            class_id = f"{title_text}|{idx}"
+                            time_text = "unknown time"
+                        
+                        matching_classes_info.append({
+                            'idx': idx,
+                            'title': title_text,
+                            'time': time_text,
+                            'id': class_id
+                        })
+                except:
+                    continue
+            
+            if matching_classes_info:
+                print(f"\nFound {len(matching_classes_info)} matching class(es):")
+                for info in matching_classes_info:
+                    print(f"  - {info['title']} at {info['time']}")
+            
+            # Check if any matching classes exist (bookable or not)
+            matching_classes_exist = len(matching_classes_info) > 0
+            bookable_classes_exist = False
+            
+            # Second pass: try to book each matching class
+            for class_info in matching_classes_info:
+                class_id = class_info['id']
+                title_text = class_info['title']
+                time_text = class_info['time']
+                
+                print(f"\n[PROCESSING] {title_text} at {time_text}")
+                
+                # Skip if already booked or failed this specific instance
+                if class_id in booked_classes:
+                    print(f"  Status: Already processed (booked/waitlisted)")
+                    continue
+                
+                if class_id in failed_classes:
+                    print(f"  Status: Already processed (failed)")
+                    continue
+                
+                # Re-fetch rows to avoid stale element issues
+                rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
+                
+                # Find the correct row again by index
+                if class_info['idx'] >= len(rows):
+                    print(f"  Status: Class no longer found on page")
+                    continue
+                
+                row = rows[class_info['idx']]
+                
+                # Try to find Book button first
+                book_btn = None
+                waitlist_btn = None
+                leave_waitlist_btn = None
+                cancel_booking_btn = None
+                
+                # Check for already booked/waitlisted states first
+                try:
+                    leave_waitlist_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--leave_waitlist")
+                    print(f"  Status: ALREADY ON WAITLIST (skipping)")
+                    booked_classes.append(class_id)
+                    continue
+                except:
+                    pass
+                
+                try:
+                    cancel_booking_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--cancel_booking")
+                    print(f"  Status: ALREADY BOOKED (skipping)")
+                    booked_classes.append(class_id)
+                    continue
+                except:
+                    pass
+                
+                # Now check for available booking options
+                try:
+                    book_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--book:not([disabled])")
+                except:
+                    # No book button, try waitlist
+                    try:
+                        waitlist_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--join_waitlist:not([disabled])")
+                    except:
+                        pass
+                
+                if book_btn:
+                    # Book button available
+                    bookable_classes_exist = True
+                    print(f"  Status: AVAILABLE - Attempting to book...")
+                    quick_delay()
+                    book_btn.click()
                     
-                    if book_btn:
-                        # Book button available
-                        bookable_classes_exist = True
-                        print(f"[BOOKING] {title_text}")
+                    result = monitor_booking_result()
+                    
+                    if result == "success":
+                        booked_classes.append(class_id)
+                        print(f"  [SUCCESS] Booked: {title_text}")
+                    elif result == "timeout":
+                        # First timeout - try once more
+                        print(f"  [RETRY] Attempting {title_text} again...")
                         quick_delay()
-                        book_btn.click()
-                        
-                        result = monitor_booking_result()
-                        
-                        if result == "success":
-                            booked_classes.append(class_id)
-                            print(f"[SUCCESS] Booked: {title_text}")
-                        elif result == "timeout":
-                            # First timeout - try once more
-                            print(f"[RETRY] Attempting {title_text} again...")
-                            quick_delay()
-                            # Need to re-find element after modal
-                            rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
-                            if idx < len(rows):
-                                row = rows[idx]
-                                try:
-                                    book_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--book:not([disabled])")
-                                    book_btn.click()
-                                    
-                                    result2 = monitor_booking_result()
-                                    if result2 == "success":
-                                        booked_classes.append(class_id)
-                                        print(f"[SUCCESS] Booked: {title_text} on retry")
-                                    else:
-                                        # Second failure - skip this class
-                                        failed_classes.add(class_id)
-                                        print(f"[SKIPPED] {title_text} - Failed twice, moving on")
-                                except:
+                        # Need to re-find element after modal
+                        rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
+                        if class_info['idx'] < len(rows):
+                            row = rows[class_info['idx']]
+                            try:
+                                book_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--book:not([disabled])")
+                                book_btn.click()
+                                
+                                result2 = monitor_booking_result()
+                                if result2 == "success":
+                                    booked_classes.append(class_id)
+                                    print(f"  [SUCCESS] Booked: {title_text} on retry")
+                                else:
+                                    # Second failure - skip this class
                                     failed_classes.add(class_id)
-                                    print(f"[SKIPPED] {title_text} - Could not retry")
-                            else:
+                                    print(f"  [SKIPPED] {title_text} - Failed twice, moving on")
+                            except:
                                 failed_classes.add(class_id)
-                                print(f"[SKIPPED] {title_text} - Could not retry")
-                        
-                    elif waitlist_btn:
-                        # Waitlist button available - join it
-                        bookable_classes_exist = True
-                        print(f"[WAITLIST] Joining waitlist for {title_text}")
+                                print(f"  [SKIPPED] {title_text} - Could not retry")
+                        else:
+                            failed_classes.add(class_id)
+                            print(f"  [SKIPPED] {title_text} - Could not retry")
+                    
+                elif waitlist_btn:
+                    # Waitlist button available - join it
+                    bookable_classes_exist = True
+                    print(f"  Status: FULLY BOOKED - Joining waitlist...")
+                    quick_delay()
+                    waitlist_btn.click()
+                    
+                    result = monitor_booking_result()
+                    
+                    if result == "success":
+                        booked_classes.append(class_id)
+                        print(f"  [SUCCESS] Joined waitlist: {title_text}")
+                    elif result == "timeout":
+                        # First timeout - try once more
+                        print(f"  [RETRY] Attempting waitlist for {title_text} again...")
                         quick_delay()
-                        waitlist_btn.click()
-                        
-                        result = monitor_booking_result()
-                        
-                        if result == "success":
-                            booked_classes.append(class_id)
-                            print(f"[SUCCESS] Joined waitlist: {title_text}")
-                        elif result == "timeout":
-                            # First timeout - try once more
-                            print(f"[RETRY] Attempting waitlist for {title_text} again...")
-                            quick_delay()
-                            rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
-                            if idx < len(rows):
-                                row = rows[idx]
-                                try:
-                                    waitlist_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--join_waitlist:not([disabled])")
-                                    waitlist_btn.click()
-                                    
-                                    result2 = monitor_booking_result()
-                                    if result2 == "success":
-                                        booked_classes.append(class_id)
-                                        print(f"[SUCCESS] Joined waitlist: {title_text} on retry")
-                                    else:
-                                        failed_classes.add(class_id)
-                                        print(f"[SKIPPED] {title_text} - Waitlist failed twice")
-                                except:
+                        rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
+                        if class_info['idx'] < len(rows):
+                            row = rows[class_info['idx']]
+                            try:
+                                waitlist_btn = row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--join_waitlist:not([disabled])")
+                                waitlist_btn.click()
+                                
+                                result2 = monitor_booking_result()
+                                if result2 == "success":
+                                    booked_classes.append(class_id)
+                                    print(f"  [SUCCESS] Joined waitlist: {title_text} on retry")
+                                else:
                                     failed_classes.add(class_id)
-                                    print(f"[SKIPPED] {title_text} - Could not retry waitlist")
-                            else:
+                                    print(f"  [SKIPPED] {title_text} - Waitlist failed twice")
+                            except:
                                 failed_classes.add(class_id)
-                                print(f"[SKIPPED] {title_text} - Could not retry waitlist")
-                    else:
-                        # No button available
-                        continue
+                                print(f"  [SKIPPED] {title_text} - Could not retry waitlist")
+                        else:
+                            failed_classes.add(class_id)
+                            print(f"  [SKIPPED] {title_text} - Could not retry waitlist")
+                else:
+                    # No button available - fully booked with no waitlist
+                    print(f"  Status: FULLY BOOKED (no waitlist available)")
+                    continue
 
+            # Log summary of scan
             if not matching_classes_exist:
                 # No matching classes found at all, refresh and try again
-                print("No matching classes found on last date, refreshing...")
+                print(f"❌ None found")
+                print("Refreshing...")
                 time.sleep(random.uniform(0.3, 1))
                 refresh_and_switch_to_iframe()
             elif not bookable_classes_exist:
                 # Matching classes exist but none are bookable
-                print("All matching classes already booked or failed. Session complete.")
+                print("✓ All matching classes already booked or failed. Session complete.")
                 break
                 
         except Exception as e:
@@ -357,8 +416,10 @@ def main():
         driver.get(TARGET_URL)
         time.sleep(1)
         
-        # Accept cookies on timetable page if needed
+        # Accept cookies on timetable page FIRST before interacting with page
+        print("Checking for cookie banner on timetable page...")
         handle_parent_page()
+        time.sleep(0.5)
 
         # --- Switch to Iframe ---
         print("Waiting for booking iframe...")
@@ -366,6 +427,27 @@ def main():
         iframe = wait.until(EC.presence_of_element_located((By.XPATH, "//iframe[contains(@src, 'nh-booking-microsite')]")))
         driver.switch_to.frame(iframe)
         print("Switched to booking iframe.")
+
+        # --- Verify Login Status ---
+        print("Verifying login status...")
+        time.sleep(1)  # Give the iframe time to load
+        
+        # Check if "Log in" button still exists (which means not logged in)
+        try:
+            logout_btn = driver.find_element(By.CSS_SELECTOR, "button.primary-btn.m--logged_out")
+            if logout_btn:
+                print("\n" + "="*60)
+                print("❌ LOGIN FAILED")
+                print("="*60)
+                print("The 'Log in' button is still showing, which means login was unsuccessful.")
+                print("="*60 + "\n")
+                driver.switch_to.default_content()
+                return
+        except:
+            # Button not found - good, we're logged in
+            pass
+        
+        print("✓ Login verified - user is logged in")
 
         # Wait for date buttons to be available
         wait.until(EC.presence_of_element_located((By.CLASS_NAME, "day-toggle__button")))
