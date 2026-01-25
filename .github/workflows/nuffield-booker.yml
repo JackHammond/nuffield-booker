@@ -2,16 +2,11 @@ name: Nuffield Booker
 
 on:
   schedule:
-    - cron: '*/5 * * * *' # every 5 minutes
-  workflow_dispatch:
-    inputs:
-      date:
-        description: 'Date to run the workflow'
-        required: true
-        type: string
-        default: 'in 5 minutes'
+    - cron: '*/5 * * * *'  # Every 5 minutes
+  workflow_dispatch:  # Manual trigger
+
 concurrency:
-  group: schedule${{ github.event.inputs.date }}
+  group: nuffield-booking
   cancel-in-progress: true
   
 jobs:
