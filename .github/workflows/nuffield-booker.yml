@@ -2,7 +2,7 @@ name: Nuffield Booker
 
 on:
   schedule:
-    - cron: '59 6 * * *'  # Runs at 6:59 AM UTC daily (adjust for your timezone)
+    - cron: '*/5 * * * *'  # Runs every 5 minutes (GitHub Actions minimum)
   workflow_dispatch:  # Allows manual trigger from GitHub Actions tab
 
 jobs:
