@@ -2,7 +2,7 @@ name: Nuffield Booker
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # Every 5 minutes
+    - cron: '59 6 * * *' 
   workflow_dispatch:  # Manual triggers
 
 concurrency:
