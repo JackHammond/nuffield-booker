@@ -3,7 +3,7 @@ name: Nuffield Booker
 on:
   schedule:
     - cron: '*/5 * * * *'  # Every 5 minutes
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:  # Manual triggers
 
 concurrency:
   group: nuffield-booking
