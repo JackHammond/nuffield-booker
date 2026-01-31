@@ -121,6 +121,10 @@ def monitor_booking_result():
 def select_last_date():
     """Selects the last date in the list if available and not already active."""
     try:
+        # Wait for date buttons to load
+        wait = WebDriverWait(driver, 10)
+        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "day-toggle__button")))
+        
         date_btns = driver.find_elements(By.CLASS_NAME, "day-toggle__button")
         if not date_btns:
             return False
