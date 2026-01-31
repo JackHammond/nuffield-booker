@@ -18,7 +18,7 @@ load_dotenv()
 EMAIL = os.getenv("EMAIL", "your_email@example.com")
 PASSWORD = os.getenv("PASSWORD", "your_password")
 TARGET_CLASSES = [
-    "Pilates",
+    "Reformer Pilates",
 ]
 LOGIN_URL = "https://my.nuffieldhealth.com/"
 TARGET_URL = os.getenv("TARGET_URL", "https://www.nuffieldhealth.com/gyms/cambridge/timetable")
