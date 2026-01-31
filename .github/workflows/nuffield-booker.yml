@@ -1,8 +1,6 @@
 name: Nuffield Booker
 
 on:
-  schedule:
-    - cron: '59 6 * * *' 
   workflow_dispatch:  # Manual triggers
 
 concurrency:
