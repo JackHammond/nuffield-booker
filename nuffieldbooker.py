@@ -232,7 +232,8 @@ def start_continuous_booking():
                 title_text = class_info['title']
                 time_text = class_info['time']
                 
-                print(f"\n[PROCESSING] {title_text} at {time_text}")
+                current_time = time.strftime('%H:%M:%S')
+                print(f"\n[PROCESSING @ {current_time}] {title_text} at {time_text}")
                 
                 # Skip if already booked or failed this specific instance
                 if class_id in booked_classes:
