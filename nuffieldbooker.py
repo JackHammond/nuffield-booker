@@ -2,6 +2,7 @@ import time
 import random
 import os
 from pathlib import Path
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -118,25 +119,57 @@ def monitor_booking_result():
         time.sleep(0.3)
     return "not_found"
 
-def select_last_date():
-    """Selects the last date in the list if available and not already active."""
+def check_target_date_available():
+    """Checks if the target date (8 days ahead) is available in the date list."""
     try:
+        # Calculate target date (8 days from today)
+        target_date = datetime.now() + timedelta(days=8)
+        target_day = target_date.strftime("%d").lstrip("0")  # Day without leading zero (e.g., "5", "13")
+        target_month_short = target_date.strftime("%b")  # Short month like "Feb" (proper case)
+        target_pattern = f"{target_day} {target_month_short}"  # e.g., "13 Feb"
+        
         # Wait for date buttons to load
         wait = WebDriverWait(driver, 10)
         wait.until(EC.presence_of_element_located((By.CLASS_NAME, "day-toggle__button")))
         
         date_btns = driver.find_elements(By.CLASS_NAME, "day-toggle__button")
         if not date_btns:
+            return False, None
+        
+        # Check if target date exists in the list
+        for btn in date_btns:
+            btn_text = btn.text.strip()  # Format: "Fri\n13 Feb" or "Fri 13 Feb"
+            # Check if target pattern (e.g., "13 Feb") is in the button text
+            if target_pattern in btn_text:
+                print(f"✓ Target date found: {btn_text.replace(chr(10), ' ')}")
+                return True, btn
+        
+        # Target date not found yet
+        last_date_text = date_btns[-1].text.strip().replace(chr(10), ' ')
+        print(f"⏳ Target date ({target_pattern}) not available yet. Last date: {last_date_text}")
+        return False, None
+    except Exception as e:
+        print(f"Error checking dates: {e}")
+        return False, None
+
+def select_target_date():
+    """Selects the target date (8 days ahead) if available and not already active."""
+    try:
+        available, target_btn = check_target_date_available()
+        if not available or not target_btn:
             return False
         
-        last_date = date_btns[-1]
-        class_attr = last_date.get_attribute("class") or ""
+        class_attr = target_btn.get_attribute("class") or ""
         
         if "m--active" not in class_attr:
-            print(f"Selecting date: {last_date.text.strip()}")
-            last_date.click()
+            print(f"Selecting target date: {target_btn.text.strip()}")
+            target_btn.click()
+            time.sleep(0.5)
+        else:
+            print(f"Target date already selected: {target_btn.text.strip()}")
         return True
-    except:
+    except Exception as e:
+        print(f"Error selecting date: {e}")
         return False
 
 def refresh_and_switch_to_iframe():
@@ -149,9 +182,7 @@ def refresh_and_switch_to_iframe():
     wait = WebDriverWait(driver, 15)
     iframe = wait.until(EC.presence_of_element_located((By.XPATH, "//iframe[contains(@src, 'nh-booking-microsite')]")))
     driver.switch_to.frame(iframe)
-    
-    # Immediately select last date after refresh
-    select_last_date()
+    time.sleep(0.5)
 
 def start_continuous_booking():
     """Continuously try to book classes for BOOKING_TIMEOUT_SECONDS."""
@@ -168,12 +199,12 @@ def start_continuous_booking():
         elapsed = int(time.time() - start_time)
         remaining = BOOKING_TIMEOUT_SECONDS - elapsed
         print(f"\n[{elapsed}s / {BOOKING_TIMEOUT_SECONDS}s] === Scan cycle {cycle} | {remaining}s remaining ===")
-        print(f"Checking for last date...")
+        print(f"Checking for target date (8 days ahead)...")
         
-        # Try to select last date
-        if not select_last_date():
-            print("Last date not available yet, refreshing...")
-            time.sleep(random.uniform(0.3, 1))
+        # Check if target date is available and select it
+        if not select_target_date():
+            print("Target date not available yet, refreshing in 2 seconds...")
+            time.sleep(2)
             refresh_and_switch_to_iframe()
             continue
         
@@ -371,11 +402,14 @@ def start_continuous_booking():
             if not matching_classes_exist:
                 # No matching classes found at all, refresh and try again
                 print(f"❌ None found")
+                time.sleep(2)
                 refresh_and_switch_to_iframe()
-            elif not bookable_classes_exist:
-                # Matching classes exist but none are bookable
+            elif not bookable_classes_exist and (booked_classes or failed_classes):
+                # We've already processed all matching classes, job done
                 print("✓ All matching classes already booked or failed. Session complete.")
                 break
+            # If classes exist but none bookable and nothing processed yet, 
+            # continue loop (they might be fully booked, keep checking for openings)
                 
         except Exception as e:
             print(f"Error during scan: {e}")
