@@ -3,12 +3,10 @@ import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 load_dotenv()
 
@@ -34,13 +32,17 @@ def log(msg):
 
 def create_driver():
     opts = Options()
+    # Always headless in CI; locally you can comment this out
+    if os.getenv("CI"):
+        opts.add_argument("--headless")
+        opts.add_argument("--window-size=1920,1080")
     for arg in [
-        #"--headless", "--window-size=1920,1080",
         "--disable-blink-features=AutomationControlled",
         "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
     ]:
         opts.add_argument(arg)
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+    # Selenium 4.6+ auto-manages chromedriver — no webdriver-manager needed
+    return webdriver.Chrome(options=opts)
 
 
 def accept_cookies(driver):
