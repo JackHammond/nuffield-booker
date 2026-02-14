@@ -1,5 +1,6 @@
 import time
 import os
+import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -13,14 +14,15 @@ load_dotenv()
 # --- Configuration ---
 EMAIL = os.getenv("EMAIL", "")
 PASSWORD = os.getenv("PASSWORD", "")
-TARGET_CLASSES = ["Reformer Pilates"]
+TARGET_CLASSES = ["Reformer Pilates", "Pilates"]
 LOGIN_URL = "https://my.nuffieldhealth.com/"
 TARGET_URL = os.getenv("TARGET_URL", "https://www.nuffieldhealth.com/gyms/cambridge/timetable")
 
-# Timing: idle until 06:59:55, classes drop at 07:00:00, give up at 07:00:15
+# Timing: idle until 06:59:55, classes drop at 07:00:00, give up after 30s
 WAIT_UNTIL = "06:59:55"
-DEADLINE = "10:00:15"
+DEADLINE = "07:00:30"
 # DEADLINE = "23:59:59"  # Uncomment for testing outside the 7am window
+MAX_LOOP_SECONDS = 30  # Hard safety cap — never loop longer than this
 
 IFRAME_XPATH = "//iframe[contains(@src, 'nh-booking-microsite')]"
 
@@ -45,14 +47,53 @@ def create_driver():
     return webdriver.Chrome(options=opts)
 
 
+def matches_target(title, targets):
+    """Fuzzy match: all words in any target must appear in the title (order-independent, case-insensitive)."""
+    title_lower = title.lower()
+    for target in targets:
+        target_words = re.findall(r'\w+', target.lower())
+        if all(word in title_lower for word in target_words):
+            return True
+    return False
+
+
 def accept_cookies(driver):
+    """Dismiss cookie consent banner via JS injection, then fall back to clicking buttons."""
+    # Method 1: Inject consent cookie directly to skip the banner entirely
     try:
-        WebDriverWait(driver, 3).until(
-            EC.element_to_be_clickable((By.ID, "ccc-notify-accept"))
-        ).click()
-        log("Cookies accepted")
+        driver.execute_script("""
+            document.cookie = "CookieControl={'necessaryCookies':[],'optionalCookies':{'analytics':'accepted','experience':'accepted','marketing':'accepted'},'statement':{},'consentDate':" + Date.now() + ",'consentExpiry':90,'interactedWith':true,'user':'0'}; path=/; max-age=7776000";
+        """)
+        # Hide any visible banner
+        driver.execute_script("""
+            var banners = document.querySelectorAll('#ccc, .ccc-overlay, .ccc-content, #ccc-notify, .ccc-module--slideout');
+            banners.forEach(function(el) { el.style.display = 'none'; });
+        """)
+        log("Cookies accepted (via JS injection)")
+        return
     except Exception:
         pass
+
+    # Method 2: Click any visible accept button
+    for selector in [
+        "#ccc-notify-accept",
+        "#ccc-recommended-settings",
+        "button.ccc-notify-button",
+        "[data-ccc-action='accept']",
+        ".ccc-accept-button",
+        "button[id*='accept']",
+        "button[class*='accept']",
+    ]:
+        try:
+            btn = WebDriverWait(driver, 3).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+            )
+            btn.click()
+            log(f"Cookies accepted (via click: {selector})")
+            return
+        except Exception:
+            continue
+    log("Cookie banner not found or already dismissed")
 
 
 def login(driver):
@@ -145,6 +186,23 @@ def wait_for_modal_result(driver):
     return "none"
 
 
+def get_class_title(element):
+    """Extract just the direct text of a class-title element, excluding child element text like 'View details'."""
+    try:
+        title_el = element.find_element(By.CLASS_NAME, "class-title")
+        # Use JS to get only direct text nodes, not child element text
+        direct_text = element.parent.execute_script(
+            "return Array.from(arguments[0].childNodes)"
+            ".filter(n => n.nodeType === Node.TEXT_NODE)"
+            ".map(n => n.textContent.trim())"
+            ".join(' ');",
+            title_el
+        )
+        return direct_text.strip() if direct_text.strip() else title_el.text.strip()
+    except Exception:
+        return None
+
+
 def try_book_classes(driver):
     """Scan page for target classes and attempt to book/waitlist. Returns list of booked class names."""
     booked = []
@@ -154,18 +212,35 @@ def try_book_classes(driver):
             EC.presence_of_element_located((By.CLASS_NAME, "class-content__wrapper"))
         )
     except Exception:
+        log("  No class-content__wrapper elements found on page")
+        # Dump a snippet of page text for debugging
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text[:500]
+            log(f"  Page text preview: {body!r}")
+        except Exception:
+            pass
         return booked
 
     rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
+    log(f"  Found {len(rows)} class row(s) on page")
 
+    # Log all class titles so we can see what's available
+    all_titles = []
+    for r in rows:
+        t = get_class_title(r)
+        all_titles.append(t or "(no title)")
+    log(f"  Classes on page: {all_titles}")
+
+    matched_any = False
     for idx, row in enumerate(rows):
-        try:
-            title = row.find_element(By.CLASS_NAME, "class-title").text.strip()
-        except Exception:
+        title = get_class_title(row)
+        if not title:
             continue
 
-        if not any(t.lower() in title.lower() for t in TARGET_CLASSES):
+        if not matches_target(title, TARGET_CLASSES):
             continue
+
+        matched_any = True
 
         try:
             class_time = row.find_element(By.CLASS_NAME, "class-time").text.strip()
@@ -173,12 +248,34 @@ def try_book_classes(driver):
             class_time = "?"
 
         label = f"{title} @ {class_time}"
+        log(f"  TARGET MATCH: {label}")
+
+        # Go up to the parent container so we can see the CTA buttons too
+        try:
+            card = row.find_element(By.XPATH, "./..")
+        except Exception:
+            card = row
 
         # Already booked or on waitlist?
         try:
-            row.find_element(By.CSS_SELECTOR, "button.primary-btn.m--cancel_booking, button.primary-btn.m--leave_waitlist")
+            card.find_element(By.CSS_SELECTOR, "button.primary-btn.m--cancel_booking, button.primary-btn.m--leave_waitlist")
             log(f"  Already booked/waitlisted: {label}")
             booked.append(label)
+            continue
+        except Exception:
+            pass
+
+        # Check if class is full / unavailable
+        try:
+            full_btn = card.find_element(By.CSS_SELECTOR, "button.primary-btn.m--is_full")
+            log(f"  FOUND but CLASS FULL: {label} — '{full_btn.text.strip()}'")
+            continue
+        except Exception:
+            pass
+
+        try:
+            status_el = card.find_element(By.CSS_SELECTOR, ".class-status-full")
+            log(f"  FOUND but UNAVAILABLE: {label} — '{status_el.text.strip()}'")
             continue
         except Exception:
             pass
@@ -187,13 +284,20 @@ def try_book_classes(driver):
         btn = None
         for selector in ["button.primary-btn.m--book:not([disabled])", "button.primary-btn.m--join_waitlist:not([disabled])"]:
             try:
-                btn = row.find_element(By.CSS_SELECTOR, selector)
+                btn = card.find_element(By.CSS_SELECTOR, selector)
                 break
             except Exception:
                 continue
 
         if not btn:
-            log(f"  No bookable button for: {label}")
+            # Log why it's not bookable — check for any disabled button
+            status = "unknown"
+            try:
+                disabled_btn = card.find_element(By.CSS_SELECTOR, "button.primary-btn[disabled]")
+                status = f"button disabled (text: '{disabled_btn.text.strip()}')"
+            except Exception:
+                pass
+            log(f"  FOUND but NOT BOOKABLE: {label} — {status}")
             continue
 
         log(f"  Clicking book/waitlist for: {label}")
@@ -207,6 +311,9 @@ def try_book_classes(driver):
             log(f"  Timeout on: {label} — will retry next cycle")
         else:
             log(f"  No confirmation for: {label}")
+
+    if not matched_any:
+        log(f"  No target classes ({TARGET_CLASSES}) found on this page")
 
     return booked
 
@@ -254,16 +361,17 @@ def main():
         # Step 2: Idle until 06:59:55
         idle_until_ready()
 
-        # Step 3: Rapid-fire booking loop until 07:00:15
+        # Step 3: Rapid-fire booking loop (max MAX_LOOP_SECONDS seconds)
         cycle = 0
         all_booked = []
+        loop_start = time.time()
 
         if past_deadline():
             log(f"Current time is past {DEADLINE} — booking window has closed, nothing to do")
         else:
-            log(f"Booking window open — refreshing until {DEADLINE}")
+            log(f"Booking window open — refreshing until {DEADLINE} (hard cap {MAX_LOOP_SECONDS}s)")
 
-        while not past_deadline():
+        while not past_deadline() and (time.time() - loop_start) < MAX_LOOP_SECONDS:
             cycle += 1
             log(f"--- Cycle {cycle} ---")
 
@@ -289,6 +397,10 @@ def main():
             if all_booked:
                 log(f"Successfully booked {len(all_booked)} class(es) — done!")
                 break
+
+        elapsed = round(time.time() - loop_start, 1)
+        if (time.time() - loop_start) >= MAX_LOOP_SECONDS:
+            log(f"Hard timeout reached after {elapsed}s — stopping")
 
         # Summary
         log("=== Session complete ===")
