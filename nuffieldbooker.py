@@ -20,7 +20,7 @@ TARGET_URL = os.getenv("TARGET_URL", "https://www.nuffieldhealth.com/gyms/cambri
 
 # Timing: idle until 06:59:55, classes drop at 07:00:00, give up after 30s
 WAIT_UNTIL = "06:59:55"
-DEADLINE = "07:00:30"
+DEADLINE = "21:00:30"
 # DEADLINE = "23:59:59"  # Uncomment for testing outside the 7am window
 MAX_LOOP_SECONDS = 30  # Hard safety cap — never loop longer than this
 
