@@ -232,6 +232,7 @@ def try_book_classes(driver):
     log(f"  Classes on page: {all_titles}")
 
     matched_any = False
+    needs_refresh = False
     for idx, row in enumerate(rows):
         title = get_class_title(row)
         if not title:
@@ -250,67 +251,76 @@ def try_book_classes(driver):
         label = f"{title} @ {class_time}"
         log(f"  TARGET MATCH: {label}")
 
-        # Go up to the parent container so we can see the CTA buttons too
         try:
-            card = row.find_element(By.XPATH, "./..")
-        except Exception:
-            card = row
-
-        # Already booked or on waitlist?
-        try:
-            card.find_element(By.CSS_SELECTOR, "button.primary-btn.m--cancel_booking, button.primary-btn.m--leave_waitlist")
-            log(f"  Already booked/waitlisted: {label}")
-            booked.append(label)
-            continue
-        except Exception:
-            pass
-
-        # Check if class is full / unavailable
-        try:
-            full_btn = card.find_element(By.CSS_SELECTOR, "button.primary-btn.m--is_full")
-            log(f"  FOUND but CLASS FULL: {label} — '{full_btn.text.strip()}'")
-            continue
-        except Exception:
-            pass
-
-        try:
-            status_el = card.find_element(By.CSS_SELECTOR, ".class-status-full")
-            log(f"  FOUND but UNAVAILABLE: {label} — '{status_el.text.strip()}'")
-            continue
-        except Exception:
-            pass
-
-        # Try Book button, then Waitlist button
-        btn = None
-        for selector in ["button.primary-btn.m--book:not([disabled])", "button.primary-btn.m--join_waitlist:not([disabled])"]:
+            # Go up to the parent container so we can see the CTA buttons too
             try:
-                btn = card.find_element(By.CSS_SELECTOR, selector)
-                break
+                card = row.find_element(By.XPATH, "./..")
             except Exception:
-                continue
+                card = row
 
-        if not btn:
-            # Log why it's not bookable — check for any disabled button
-            status = "unknown"
+            # Already booked or on waitlist?
             try:
-                disabled_btn = card.find_element(By.CSS_SELECTOR, "button.primary-btn[disabled]")
-                status = f"button disabled (text: '{disabled_btn.text.strip()}')"
+                card.find_element(By.CSS_SELECTOR, "button.primary-btn.m--cancel_booking, button.primary-btn.m--leave_waitlist")
+                log(f"  Already booked/waitlisted: {label}")
+                booked.append(label)
+                continue
             except Exception:
                 pass
-            log(f"  FOUND but NOT BOOKABLE: {label} — {status}")
-            continue
 
-        log(f"  Clicking book/waitlist for: {label}")
-        btn.click()
+            # Check if class is full / unavailable
+            try:
+                full_btn = card.find_element(By.CSS_SELECTOR, "button.primary-btn.m--is_full")
+                log(f"  FOUND but CLASS FULL: {label} — '{full_btn.text.strip()}'")
+                continue
+            except Exception:
+                pass
 
-        result = wait_for_modal_result(driver)
-        if result == "success":
-            log(f"  BOOKED: {label}")
-            booked.append(label)
-        elif result == "timeout":
-            log(f"  Timeout on: {label} — will retry next cycle")
-        else:
-            log(f"  No confirmation for: {label}")
+            try:
+                status_el = card.find_element(By.CSS_SELECTOR, ".class-status-full")
+                log(f"  FOUND but UNAVAILABLE: {label} — '{status_el.text.strip()}'")
+                continue
+            except Exception:
+                pass
+
+            # Try Book button, then Waitlist button
+            btn = None
+            for selector in ["button.primary-btn.m--book:not([disabled])", "button.primary-btn.m--join_waitlist:not([disabled])"]:
+                try:
+                    btn = card.find_element(By.CSS_SELECTOR, selector)
+                    break
+                except Exception:
+                    continue
+
+            if not btn:
+                # Log why it's not bookable — check for any disabled button
+                status = "unknown"
+                try:
+                    disabled_btn = card.find_element(By.CSS_SELECTOR, "button.primary-btn[disabled]")
+                    status = f"button disabled (text: '{disabled_btn.text.strip()}')"
+                except Exception:
+                    pass
+                log(f"  FOUND but NOT BOOKABLE: {label} — {status}")
+                continue
+
+            log(f"  Clicking book/waitlist for: {label}")
+            # Use JS click to bypass fixed nav bar intercepting the click
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", btn)
+
+            result = wait_for_modal_result(driver)
+            if result == "success":
+                log(f"  BOOKED: {label}")
+                booked.append(label)
+            elif result == "timeout":
+                log(f"  Timeout on: {label} — elements now stale, will retry next cycle")
+                needs_refresh = True
+                break
+            else:
+                log(f"  No confirmation for: {label}")
+
+        except Exception as e:
+            log(f"  Error processing {label}: {e} — skipping to next cycle")
+            needs_refresh = True
+            break
 
     if not matched_any:
         log(f"  No target classes ({TARGET_CLASSES}) found on this page")
