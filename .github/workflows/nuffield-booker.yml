@@ -31,7 +31,7 @@ jobs:
     
     - name: Install Python dependencies
       run: |
-        pip install selenium python-dotenv
+        pip install selenium python-dotenv requests
     
     - name: Run booking script
       env:

@@ -1,6 +1,9 @@
 import time
 import os
 import re
+import json
+import uuid
+import requests as http_requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -14,13 +17,16 @@ load_dotenv()
 # --- Configuration ---
 EMAIL = os.getenv("EMAIL", "")
 PASSWORD = os.getenv("PASSWORD", "")
-TARGET_CLASSES = ["Reformer Pilates", "Pilates"]
+TARGET_CLASSES = os.getenv("TARGET_CLASSES", "").split(",")
 LOGIN_URL = "https://my.nuffieldhealth.com/"
-TARGET_URL = os.getenv("TARGET_URL", "https://www.nuffieldhealth.com/gyms/cambridge/timetable")
+TARGET_URL = os.getenv("TARGET_URL", "")
+LOCATION_ID = os.getenv("TARGET_LOCATION_ID", "")
+API_BASE = "https://api.nuffieldhealth.com/booking/member/1.0"
+API_KEY = os.getenv("API_KEY", "")
 
 # Timing: idle until 06:59:55, classes drop at 07:00:00, give up after 30s
-WAIT_UNTIL = "06:59:55"
-DEADLINE = "07:00:30"
+WAIT_UNTIL = os.getenv("WAIT_UNTIL", "")
+DEADLINE = os.getenv("DEADLINE", "")  # Default to 10s after the hour to allow for clock skew
 # DEADLINE = "23:59:59"  # Uncomment for testing outside the 7am window
 MAX_LOOP_SECONDS = 30  # Hard safety cap — never loop longer than this
 
@@ -30,21 +36,6 @@ IFRAME_XPATH = "//iframe[contains(@src, 'nh-booking-microsite')]"
 def log(msg):
     """Print with timestamp."""
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}")
-
-
-def create_driver():
-    opts = Options()
-    # Always headless in CI; locally you can comment this out
-    if os.getenv("CI"):
-        opts.add_argument("--headless")
-        opts.add_argument("--window-size=1920,1080")
-    for arg in [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
-    ]:
-        opts.add_argument(arg)
-    # Selenium 4.6+ auto-manages chromedriver — no webdriver-manager needed
-    return webdriver.Chrome(options=opts)
 
 
 def matches_target(title, targets):
@@ -57,50 +48,45 @@ def matches_target(title, targets):
     return False
 
 
+# ============================================================
+# Browser (Selenium) — used ONLY for login + Bearer token capture
+# ============================================================
+
+def create_driver():
+    opts = Options()
+    if os.getenv("CI"):
+        opts.add_argument("--headless")
+        opts.add_argument("--window-size=1920,1080")
+    for arg in [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
+    ]:
+        opts.add_argument(arg)
+    # Enable Chrome performance logging so we can capture the Bearer token
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    return webdriver.Chrome(options=opts)
+
+
 def accept_cookies(driver):
-    """Dismiss cookie consent banner via JS injection, then fall back to clicking buttons."""
-    # Method 1: Inject consent cookie directly to skip the banner entirely
+    """Dismiss cookie consent banner via JS injection."""
     try:
         driver.execute_script("""
             document.cookie = "CookieControl={'necessaryCookies':[],'optionalCookies':{'analytics':'accepted','experience':'accepted','marketing':'accepted'},'statement':{},'consentDate':" + Date.now() + ",'consentExpiry':90,'interactedWith':true,'user':'0'}; path=/; max-age=7776000";
         """)
-        # Hide any visible banner
         driver.execute_script("""
             var banners = document.querySelectorAll('#ccc, .ccc-overlay, .ccc-content, #ccc-notify, .ccc-module--slideout');
             banners.forEach(function(el) { el.style.display = 'none'; });
         """)
         log("Cookies accepted (via JS injection)")
-        return
     except Exception:
         pass
 
-    # Method 2: Click any visible accept button
-    for selector in [
-        "#ccc-notify-accept",
-        "#ccc-recommended-settings",
-        "button.ccc-notify-button",
-        "[data-ccc-action='accept']",
-        ".ccc-accept-button",
-        "button[id*='accept']",
-        "button[class*='accept']",
-    ]:
-        try:
-            btn = WebDriverWait(driver, 3).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-            )
-            btn.click()
-            log(f"Cookies accepted (via click: {selector})")
-            return
-        except Exception:
-            continue
-    log("Cookie banner not found or already dismissed")
 
-
-def login(driver):
+def browser_login(driver):
+    """Login via browser (Azure AD B2C requires browser-based auth)."""
     log("Logging in...")
     driver.get(LOGIN_URL)
     accept_cookies(driver)
-
     try:
         wait = WebDriverWait(driver, 5)
         wait.until(EC.presence_of_element_located((By.ID, "email"))).send_keys(EMAIL)
@@ -112,221 +98,152 @@ def login(driver):
         log("Login fields not found — may already be logged in")
 
 
-def navigate_to_timetable(driver):
-    log("Navigating to timetable...")
+def extract_bearer_token(driver):
+    """Navigate to timetable so the booking iframe loads and makes API calls,
+    then capture the Bearer token from Chrome's network performance logs.
+    Falls back to reading the microsite's sessionStorage if logs fail."""
+    log("Navigating to timetable to capture Bearer token...")
     driver.get(TARGET_URL)
     accept_cookies(driver)
 
+    try:
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.XPATH, IFRAME_XPATH))
+        )
+        log("Iframe loaded, waiting for microsite API calls...")
+        time.sleep(8)
+    except Exception:
+        log("WARNING: Iframe not found on page")
 
-def switch_to_iframe(driver):
-    driver.switch_to.default_content()
-    iframe = WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located((By.XPATH, IFRAME_XPATH))
+    # Method 1: Chrome performance logs (captures all network traffic incl. iframes)
+    token = _token_from_perf_logs(driver)
+    if token:
+        return token
+
+    # Method 2: sessionStorage inside the iframe (MSAL token cache)
+    token = _token_from_session_storage(driver)
+    if token:
+        return token
+
+    log("ERROR: Could not extract Bearer token")
+    return None
+
+
+def _token_from_perf_logs(driver):
+    """Extract Bearer token from Chrome's network performance logs."""
+    try:
+        logs = driver.get_log("performance")
+        for entry in logs:
+            try:
+                msg = json.loads(entry["message"])["message"]
+                if msg["method"] == "Network.requestWillBeSent":
+                    req = msg["params"]["request"]
+                    if "api.nuffieldhealth.com" in req.get("url", ""):
+                        auth = req.get("headers", {}).get("Authorization", "")
+                        if auth.startswith("Bearer "):
+                            log("Bearer token captured from network logs")
+                            return auth[7:]
+            except (KeyError, json.JSONDecodeError):
+                continue
+    except Exception as e:
+        log(f"Performance log read failed: {e}")
+    return None
+
+
+def _token_from_session_storage(driver):
+    """Fallback: extract token from the microsite iframe's sessionStorage (MSAL cache)."""
+    try:
+        driver.switch_to.default_content()
+        iframe = driver.find_element(By.XPATH, IFRAME_XPATH)
+        driver.switch_to.frame(iframe)
+        storage_json = driver.execute_script("""
+            var items = {};
+            for (var i = 0; i < sessionStorage.length; i++) {
+                var k = sessionStorage.key(i);
+                items[k] = sessionStorage.getItem(k);
+            }
+            return JSON.stringify(items);
+        """)
+        storage = json.loads(storage_json)
+        for key, value in storage.items():
+            if not value:
+                continue
+            # Direct JWT value
+            if value.startswith("eyJ"):
+                log(f"Token found in sessionStorage (key: {key})")
+                return value
+            # JSON object containing a token field
+            try:
+                obj = json.loads(value)
+                if isinstance(obj, dict):
+                    for f in ("secret", "access_token", "accessToken", "idToken", "id_token"):
+                        v = obj.get(f, "")
+                        if isinstance(v, str) and v.startswith("eyJ"):
+                            log(f"Token found in sessionStorage (key: {key}, field: {f})")
+                            return v
+            except (json.JSONDecodeError, TypeError):
+                pass
+    except Exception as e:
+        log(f"SessionStorage extraction failed: {e}")
+    return None
+
+
+# ============================================================
+# Pure API calls — no browser needed from here on
+# ============================================================
+
+def api_headers(token):
+    """Standard headers for Nuffield booking API."""
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Ocp-Apim-Subscription-Key": API_KEY,
+        "Origin": "https://nh-booking-microsite.nuffieldhealth.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        "X-Transaction-Id": str(uuid.uuid4()),
+        "Device-Time": str(int(time.time() * 1000)),
+    }
+
+
+def fetch_classes(token, target_date):
+    """GET bookable classes for a specific date from the API."""
+    url = f"{API_BASE}/bookable_items/gym/"
+    params = {
+        "location": LOCATION_ID,
+        "from_date": target_date.strftime("%Y-%m-%dT00:00:00.000+00:00"),
+        "to_date": target_date.strftime("%Y-%m-%dT23:59:59.999+00:00"),
+    }
+    resp = http_requests.get(url, params=params, headers=api_headers(token), timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def book_class(token, reservation_id):
+    """POST to book a class by its reservation ID."""
+    url = f"{API_BASE}/bookings/gym/"
+    resp = http_requests.post(
+        url,
+        json={"reservation": reservation_id},
+        headers=api_headers(token),
+        timeout=10,
     )
-    driver.switch_to.frame(iframe)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def verify_logged_in(driver):
-    """Return True if logged in (no 'Log in' button visible)."""
+def format_time(iso_str):
+    """Convert ISO datetime string to HH:MM for display."""
     try:
-        driver.find_element(By.CSS_SELECTOR, "button.primary-btn.m--logged_out")
-        return False
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%H:%M")
     except Exception:
-        return True
+        return iso_str or "?"
 
 
-def select_target_date(driver):
-    """Click the date button for 8 days from now. Returns True if found & selected."""
-    target = datetime.now() + timedelta(days=8)
-    pattern = f"{target.day} {target.strftime('%b')}"  # e.g. "20 Feb"
-
-    try:
-        WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "day-toggle__button"))
-        )
-        for btn in driver.find_elements(By.CLASS_NAME, "day-toggle__button"):
-            if pattern in btn.text:
-                if "m--active" not in (btn.get_attribute("class") or ""):
-                    btn.click()
-                log(f"Target date selected: {pattern}")
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def has_available_at_7am_text(driver):
-    """Check if the page still shows 'Available at 7am' (pre-release state)."""
-    try:
-        page_text = driver.find_element(By.TAG_NAME, "body").text
-        return "available at 7am" in page_text.lower()
-    except Exception:
-        return False
-
-
-def wait_for_modal_result(driver):
-    """Wait up to 8s for booking confirmation or timeout modal. Returns 'success'/'timeout'/'none'."""
-    end = time.time() + 8
-    while time.time() < end:
-        try:
-            modals = driver.find_elements(By.CLASS_NAME, "modal-subtitle")
-            if modals and "timed out" in modals[0].text.lower():
-                driver.find_element(By.CSS_SELECTOR, ".modal-button.modal-cta__button").click()
-                return "timeout"
-        except Exception:
-            pass
-        try:
-            done_btns = driver.find_elements(By.CSS_SELECTOR, "button.modal-outline__button")
-            if done_btns and "Done" in done_btns[0].text:
-                done_btns[0].click()
-                return "success"
-        except Exception:
-            pass
-        time.sleep(0.1)
-    return "none"
-
-
-def get_class_title(element):
-    """Extract just the direct text of a class-title element, excluding child element text like 'View details'."""
-    try:
-        title_el = element.find_element(By.CLASS_NAME, "class-title")
-        # Use JS to get only direct text nodes, not child element text
-        direct_text = element.parent.execute_script(
-            "return Array.from(arguments[0].childNodes)"
-            ".filter(n => n.nodeType === Node.TEXT_NODE)"
-            ".map(n => n.textContent.trim())"
-            ".join(' ');",
-            title_el
-        )
-        return direct_text.strip() if direct_text.strip() else title_el.text.strip()
-    except Exception:
-        return None
-
-
-def try_book_classes(driver):
-    """Scan page for target classes and attempt to book/waitlist. Returns list of booked class names."""
-    booked = []
-
-    try:
-        WebDriverWait(driver, 3).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "class-content__wrapper"))
-        )
-    except Exception:
-        log("  No class-content__wrapper elements found on page")
-        # Dump a snippet of page text for debugging
-        try:
-            body = driver.find_element(By.TAG_NAME, "body").text[:500]
-            log(f"  Page text preview: {body!r}")
-        except Exception:
-            pass
-        return booked
-
-    rows = driver.find_elements(By.CLASS_NAME, "class-content__wrapper")
-    log(f"  Found {len(rows)} class row(s) on page")
-
-    # Log all class titles so we can see what's available
-    all_titles = []
-    for r in rows:
-        t = get_class_title(r)
-        all_titles.append(t or "(no title)")
-    log(f"  Classes on page: {all_titles}")
-
-    matched_any = False
-    needs_refresh = False
-    for idx, row in enumerate(rows):
-        title = get_class_title(row)
-        if not title:
-            continue
-
-        if not matches_target(title, TARGET_CLASSES):
-            continue
-
-        matched_any = True
-
-        try:
-            class_time = row.find_element(By.CLASS_NAME, "class-time").text.strip()
-        except Exception:
-            class_time = "?"
-
-        label = f"{title} @ {class_time}"
-        log(f"  TARGET MATCH: {label}")
-
-        try:
-            # Go up to the parent container so we can see the CTA buttons too
-            try:
-                card = row.find_element(By.XPATH, "./..")
-            except Exception:
-                card = row
-
-            # Already booked or on waitlist?
-            try:
-                card.find_element(By.CSS_SELECTOR, "button.primary-btn.m--cancel_booking, button.primary-btn.m--leave_waitlist")
-                log(f"  Already booked/waitlisted: {label}")
-                booked.append(label)
-                continue
-            except Exception:
-                pass
-
-            # Check if class is full / unavailable
-            try:
-                full_btn = card.find_element(By.CSS_SELECTOR, "button.primary-btn.m--is_full")
-                log(f"  FOUND but CLASS FULL: {label} — '{full_btn.text.strip()}'")
-                continue
-            except Exception:
-                pass
-
-            try:
-                status_el = card.find_element(By.CSS_SELECTOR, ".class-status-full")
-                log(f"  FOUND but UNAVAILABLE: {label} — '{status_el.text.strip()}'")
-                continue
-            except Exception:
-                pass
-
-            # Try Book button, then Waitlist button
-            btn = None
-            for selector in ["button.primary-btn.m--book:not([disabled])", "button.primary-btn.m--join_waitlist:not([disabled])"]:
-                try:
-                    btn = card.find_element(By.CSS_SELECTOR, selector)
-                    break
-                except Exception:
-                    continue
-
-            if not btn:
-                # Log why it's not bookable — check for any disabled button
-                status = "unknown"
-                try:
-                    disabled_btn = card.find_element(By.CSS_SELECTOR, "button.primary-btn[disabled]")
-                    status = f"button disabled (text: '{disabled_btn.text.strip()}')"
-                except Exception:
-                    pass
-                log(f"  FOUND but NOT BOOKABLE: {label} — {status}")
-                continue
-
-            log(f"  Clicking book/waitlist for: {label}")
-            # Use JS click to bypass fixed nav bar intercepting the click
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", btn)
-
-            result = wait_for_modal_result(driver)
-            if result == "success":
-                log(f"  BOOKED: {label}")
-                booked.append(label)
-            elif result == "timeout":
-                log(f"  Timeout on: {label} — elements now stale, will retry next cycle")
-                needs_refresh = True
-                break
-            else:
-                log(f"  No confirmation for: {label}")
-
-        except Exception as e:
-            log(f"  Error processing {label}: {e} — skipping to next cycle")
-            needs_refresh = True
-            break
-
-    if not matched_any:
-        log(f"  No target classes ({TARGET_CLASSES}) found on this page")
-
-    return booked
-
+# ============================================================
+# Timing helpers
+# ============================================================
 
 def past_deadline():
     return datetime.now().strftime("%H:%M:%S") >= DEADLINE
@@ -344,87 +261,171 @@ def idle_until_ready():
     log("Idle complete — go time!")
 
 
+# ============================================================
+# Main
+# ============================================================
+
 def main():
-    log("=== Nuffield Booker ===")
+    log("=== Nuffield Booker (API Mode) ===")
 
     if not EMAIL or not PASSWORD:
         log("ERROR: EMAIL and PASSWORD env vars must be set")
         return
 
+    # ---- Phase 1: Browser login + token capture ----
     driver = create_driver()
+    token = None
     try:
-        # Step 1: Login & navigate (do this before idling so we're ready)
-        login(driver)
-        navigate_to_timetable(driver)
-        switch_to_iframe(driver)
-
-        if not verify_logged_in(driver):
-            log("LOGIN FAILED — aborting")
-            return
-
-        log("Logged in successfully")
-
-        # Select the target date now while we wait
-        if not select_target_date(driver):
-            log("Target date not visible yet — will retry after idle")
-
-        # Step 2: Idle until 06:59:55
-        idle_until_ready()
-
-        # Step 3: Rapid-fire booking loop (max MAX_LOOP_SECONDS seconds)
-        cycle = 0
-        all_booked = []
-        loop_start = time.time()
-
-        if past_deadline():
-            log(f"Current time is past {DEADLINE} — booking window has closed, nothing to do")
-        else:
-            log(f"Booking window open — refreshing until {DEADLINE} (hard cap {MAX_LOOP_SECONDS}s)")
-
-        while not past_deadline() and (time.time() - loop_start) < MAX_LOOP_SECONDS:
-            cycle += 1
-            log(f"--- Cycle {cycle} ---")
-
-            # Refresh page & re-enter iframe
-            driver.switch_to.default_content()
-            driver.refresh()
-            switch_to_iframe(driver)
-
-            # Select target date
-            if not select_target_date(driver):
-                log("Target date not found, retrying...")
-                continue
-
-            # If still showing "Available at 7am", classes haven't dropped yet
-            if has_available_at_7am_text(driver):
-                log("Classes not released yet (Available at 7am) — refreshing...")
-                continue
-
-            # Try to book
-            booked = try_book_classes(driver)
-            all_booked.extend(booked)
-
-            if all_booked:
-                log(f"Successfully booked {len(all_booked)} class(es) — done!")
-                break
-
-        elapsed = round(time.time() - loop_start, 1)
-        if (time.time() - loop_start) >= MAX_LOOP_SECONDS:
-            log(f"Hard timeout reached after {elapsed}s — stopping")
-
-        # Summary
-        log("=== Session complete ===")
-        if all_booked:
-            log(f"Booked {len(all_booked)} class(es) in {cycle} cycle(s):")
-            for c in all_booked:
-                log(f"  Booked: {c}")
-        elif cycle == 0:
-            log("No booking cycles ran — script started after the 07:00:15 deadline")
-        else:
-            log(f"No classes booked after {cycle} cycle(s) — all slots were taken")
-
+        browser_login(driver)
+        token = extract_bearer_token(driver)
     finally:
         driver.quit()
+        log("Browser closed")
+
+    if not token:
+        log("FATAL: Could not obtain Bearer token — aborting")
+        return
+
+    log(f"Bearer token acquired (length: {len(token)})")
+    log("All further operations use direct API calls — no browser needed")
+
+    # ---- Phase 2: Prepare ----
+    target_date = datetime.now() + timedelta(days=8)
+    log(f"Target date: {target_date.strftime('%A %d %B %Y')}")
+
+    # Quick API sanity check with today's classes
+    try:
+        test = fetch_classes(token, datetime.now())
+        items = test.get("items", []) if isinstance(test, dict) else test
+        log(f"API sanity check OK — {len(items)} classes returned for today")
+        if items and isinstance(items[0], dict):
+            log(f"  Sample item keys: {list(items[0].keys())}")
+    except Exception as e:
+        log(f"API sanity check FAILED: {e} — token may be invalid")
+        return
+
+    # ---- Phase 3: Idle until booking window ----
+    idle_until_ready()
+
+    # ---- Phase 4: Rapid-fire API booking loop ----
+    cycle = 0
+    all_booked = []
+    loop_start = time.time()
+
+    if past_deadline():
+        log(f"Current time is past {DEADLINE} — booking window has closed, nothing to do")
+    else:
+        log(f"Booking window open — polling API until {DEADLINE} (hard cap {MAX_LOOP_SECONDS}s)")
+
+    while not past_deadline() and (time.time() - loop_start) < MAX_LOOP_SECONDS:
+        cycle += 1
+        log(f"--- Cycle {cycle} ---")
+
+        try:
+            data = fetch_classes(token, target_date)
+        except Exception as e:
+            log(f"  API error: {e}")
+            time.sleep(0.3)
+            continue
+
+        # Response format: {"items": [...]}
+        items = data.get("items", []) if isinstance(data, dict) else data
+
+        if not items:
+            log("  No classes returned by API")
+            if cycle == 1:
+                log(f"  Response preview: {json.dumps(data)[:500]}")
+            time.sleep(0.3)
+            continue
+
+        log(f"  {len(items)} class(es) returned")
+
+        # Log all class names on the first cycle
+        if cycle == 1:
+            names = [i.get("title", "?") for i in items]
+            log(f"  Classes: {names}")
+
+        matched_any = False
+        for item in items:
+            name = item.get("title", "")
+            if not matches_target(name, TARGET_CLASSES):
+                continue
+
+            matched_any = True
+            res_id = item.get("sfid", "")
+            start = item.get("from_date", "")
+            end = item.get("to_date", "")
+            is_full = item.get("is_full", False)
+            has_waitlist = item.get("has_waitlist", False)
+            my_booking = item.get("my_booking")  # None if not booked
+            status = item.get("status", "")
+            capacity = item.get("attendance_capacity", 0)
+            attendees = item.get("attendees", 0)
+
+            label = f"{name} @ {format_time(start)} - {format_time(end)}"
+            log(f"  TARGET MATCH: {label} (status: {status}, full: {is_full}, attendees: {attendees}/{int(capacity)})")
+
+            # Already booked
+            if my_booking is not None:
+                booking_status = my_booking.get("status", "") if isinstance(my_booking, dict) else str(my_booking)
+                log(f"  Already booked/waitlisted: {label} ({booking_status})")
+                all_booked.append(label)
+                continue
+
+            # Full and no waitlist
+            if is_full and not has_waitlist:
+                log(f"  CLASS FULL (no waitlist): {label}")
+                continue
+
+            # Full but has waitlist — we'll still try to book (API returns waitlist)
+            if is_full and has_waitlist:
+                log(f"  CLASS FULL but has waitlist: {label} — attempting...")
+
+            # No reservation ID means we can't book
+            if not res_id:
+                log(f"  No reservation ID for {label} — cannot book yet")
+                continue
+
+            # Attempt booking via API
+            try:
+                log(f"  Booking: {label} (reservation: {res_id})...")
+                result = book_class(token, res_id)
+                result_status = result.get("status", "UNKNOWN").upper()
+                log(f"  RESULT: {result_status} — {label}")
+                if result_status in ("BOOKED", "WAITLISTED"):
+                    all_booked.append(label)
+            except http_requests.HTTPError as e:
+                log(f"  Booking FAILED (HTTP {e.response.status_code}): {label}")
+                try:
+                    log(f"  Error body: {e.response.text[:300]}")
+                except Exception:
+                    pass
+            except Exception as e:
+                log(f"  Booking FAILED: {label} — {e}")
+
+        if not matched_any:
+            log(f"  No target classes ({TARGET_CLASSES}) found in response")
+
+        if all_booked:
+            log(f"Successfully booked {len(all_booked)} class(es) — done!")
+            break
+
+        time.sleep(0.3)
+
+    # ---- Summary ----
+    elapsed = round(time.time() - loop_start, 1)
+    if (time.time() - loop_start) >= MAX_LOOP_SECONDS:
+        log(f"Hard timeout reached after {elapsed}s — stopping")
+
+    log("=== Session complete ===")
+    if all_booked:
+        log(f"Booked {len(all_booked)} class(es) in {cycle} cycle(s):")
+        for c in all_booked:
+            log(f"  Booked: {c}")
+    elif cycle == 0:
+        log("No booking cycles ran — script started after the deadline")
+    else:
+        log(f"No classes booked after {cycle} cycle(s) — all slots were taken")
 
 
 if __name__ == "__main__":
