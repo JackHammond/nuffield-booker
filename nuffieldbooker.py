@@ -5,6 +5,7 @@ import json
 import uuid
 import requests as http_requests
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -261,6 +262,102 @@ def idle_until_ready():
     log("Idle complete — go time!")
 
 
+def busy_wait_until(target_time_str):
+    """Tight busy-wait (no sleep) until HH:MM:SS.mmm. Accurate to ~1ms."""
+    log(f"Busy-waiting until {target_time_str}...")
+    while True:
+        now = datetime.now()
+        now_str = now.strftime("%H:%M:%S.") + f"{now.microsecond // 1000:03d}"
+        if now_str >= target_time_str:
+            log(f"GO! (actual: {now_str})")
+            return
+
+
+BOOK_AT = "07:00:00.100"  # Fire bookings 100ms after the hour
+
+
+def prefetch_targets(token, target_date):
+    """Fetch the class list and return only the matching target classes with reservation IDs."""
+    data = fetch_classes(token, target_date)
+    items = data.get("items", []) if isinstance(data, dict) else data
+
+    if not items:
+        log("  Pre-fetch returned no classes")
+        return []
+
+    log(f"  Pre-fetch returned {len(items)} class(es)")
+    names = [i.get("title", "?") for i in items]
+    log(f"  Classes: {names}")
+
+    targets = []
+    for item in items:
+        name = item.get("title", "")
+        if not matches_target(name, TARGET_CLASSES):
+            continue
+
+        res_id = item.get("sfid", "")
+        start = item.get("from_date", "")
+        end = item.get("to_date", "")
+        is_full = item.get("is_full", False)
+        has_waitlist = item.get("has_waitlist", False)
+        my_booking = item.get("my_booking")
+        capacity = item.get("attendance_capacity", 0)
+        attendees = item.get("attendees", 0)
+
+        label = f"{name} @ {format_time(start)} - {format_time(end)}"
+
+        if my_booking is not None:
+            booking_status = my_booking.get("status", "") if isinstance(my_booking, dict) else str(my_booking)
+            log(f"  SKIP (already {booking_status}): {label}")
+            continue
+
+        if is_full and not has_waitlist:
+            log(f"  SKIP (full, no waitlist): {label}")
+            continue
+
+        if not res_id:
+            log(f"  SKIP (no reservation ID): {label}")
+            continue
+
+        log(f"  QUEUED: {label} (res: {res_id}, {attendees}/{int(capacity)})")
+        targets.append({"sfid": res_id, "label": label, "item": item})
+
+    return targets
+
+
+def fire_all_bookings(token, targets):
+    """Book all target classes in parallel. Returns list of (label, result_or_error)."""
+    results = []
+
+    def _book_one(target):
+        label = target["label"]
+        res_id = target["sfid"]
+        try:
+            log(f"  >> Booking: {label}")
+            result = book_class(token, res_id)
+            status = result.get("status", "UNKNOWN").upper()
+            log(f"  << {status}: {label}")
+            return (label, result)
+        except http_requests.HTTPError as e:
+            body = ""
+            try:
+                body = e.response.text[:300]
+            except Exception:
+                pass
+            log(f"  << FAILED (HTTP {e.response.status_code}): {label} — {body}")
+            return (label, {"status": "FAILED", "error": body})
+        except Exception as e:
+            log(f"  << FAILED: {label} — {e}")
+            return (label, {"status": "FAILED", "error": str(e)})
+
+    with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        futures = {pool.submit(_book_one, t): t for t in targets}
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    return results
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -298,28 +395,57 @@ def main():
         test = fetch_classes(token, datetime.now())
         items = test.get("items", []) if isinstance(test, dict) else test
         log(f"API sanity check OK — {len(items)} classes returned for today")
-        if items and isinstance(items[0], dict):
-            log(f"  Sample item keys: {list(items[0].keys())}")
     except Exception as e:
         log(f"API sanity check FAILED: {e} — token may be invalid")
         return
 
-    # ---- Phase 3: Idle until booking window ----
-    idle_until_ready()
+    # ---- Phase 3: Pre-fetch target classes (before 7am) ----
+    log("--- Pre-fetching target classes for booking day ---")
+    try:
+        targets = prefetch_targets(token, target_date)
+    except Exception as e:
+        log(f"Pre-fetch FAILED: {e}")
+        targets = []
 
-    # ---- Phase 4: Rapid-fire API booking loop ----
-    cycle = 0
+    if not targets:
+        log("No bookable target classes found in pre-fetch — will retry at booking time")
+
+    log(f"Pre-fetched {len(targets)} target class(es) to book")
+
+    # ---- Phase 4: Wait until exactly 07:00:00.500 ----
+    now_str = datetime.now().strftime("%H:%M:%S")
+    if now_str >= BOOK_AT:
+        log(f"Already past {BOOK_AT} — firing bookings immediately")
+    else:
+        idle_until_ready()  # Coarse sleep until ~06:59:55
+        busy_wait_until(BOOK_AT)  # Tight spin until 07:00:00.500
+
+    # ---- Phase 5: Fire all bookings in parallel ----
     all_booked = []
     loop_start = time.time()
 
-    if past_deadline():
-        log(f"Current time is past {DEADLINE} — booking window has closed, nothing to do")
-    else:
-        log(f"Booking window open — polling API until {DEADLINE} (hard cap {MAX_LOOP_SECONDS}s)")
+    if targets:
+        log(f"=== Firing {len(targets)} booking(s) in parallel ===")
+        results = fire_all_bookings(token, targets)
+        for label, result in results:
+            status = result.get("status", "UNKNOWN").upper() if isinstance(result, dict) else "UNKNOWN"
+            waitlist_pos = result.get("waitlist_position") if isinstance(result, dict) else None
+            if status in ("BOOKED", "WAITLISTED", "WAITLIST", "CONFIRMED") or waitlist_pos is not None:
+                all_booked.append(label)
 
-    while not past_deadline() and (time.time() - loop_start) < MAX_LOOP_SECONDS:
+    # ---- Phase 6: Retry loop for any that failed or weren't pre-fetched ----
+    cycle = 0
+    retry_start = time.time()
+    # Only retry if we didn't get everything or had no targets
+    need_retry = (len(all_booked) < len(targets)) or (not targets)
+    # Deadline is used only as an idle timeout cap for retries (not a gate on bookings)
+
+    if need_retry and not past_deadline() and (time.time() - loop_start) < MAX_LOOP_SECONDS:
+        log("--- Retry loop (re-fetching + booking remaining) ---")
+
+    while need_retry and not past_deadline() and (time.time() - loop_start) < MAX_LOOP_SECONDS:
         cycle += 1
-        log(f"--- Cycle {cycle} ---")
+        log(f"--- Retry cycle {cycle} ---")
 
         try:
             data = fetch_classes(token, target_date)
@@ -328,87 +454,60 @@ def main():
             time.sleep(0.3)
             continue
 
-        # Response format: {"items": [...]}
         items = data.get("items", []) if isinstance(data, dict) else data
-
         if not items:
-            log("  No classes returned by API")
-            if cycle == 1:
-                log(f"  Response preview: {json.dumps(data)[:500]}")
+            log("  No classes returned")
             time.sleep(0.3)
             continue
 
-        log(f"  {len(items)} class(es) returned")
-
-        # Log all class names on the first cycle
-        if cycle == 1:
-            names = [i.get("title", "?") for i in items]
-            log(f"  Classes: {names}")
-
-        matched_any = False
+        retry_targets = []
         for item in items:
             name = item.get("title", "")
             if not matches_target(name, TARGET_CLASSES):
                 continue
 
-            matched_any = True
             res_id = item.get("sfid", "")
             start = item.get("from_date", "")
             end = item.get("to_date", "")
             is_full = item.get("is_full", False)
             has_waitlist = item.get("has_waitlist", False)
-            my_booking = item.get("my_booking")  # None if not booked
-            status = item.get("status", "")
+            my_booking = item.get("my_booking")
             capacity = item.get("attendance_capacity", 0)
             attendees = item.get("attendees", 0)
 
             label = f"{name} @ {format_time(start)} - {format_time(end)}"
-            log(f"  TARGET MATCH: {label} (status: {status}, full: {is_full}, attendees: {attendees}/{int(capacity)})")
 
-            # Already booked
+            # Skip if already booked (either already in our list, or server says so)
             if my_booking is not None:
-                booking_status = my_booking.get("status", "") if isinstance(my_booking, dict) else str(my_booking)
-                log(f"  Already booked/waitlisted: {label} ({booking_status})")
-                all_booked.append(label)
-                continue
-
-            # Full and no waitlist
-            if is_full and not has_waitlist:
-                log(f"  CLASS FULL (no waitlist): {label}")
-                continue
-
-            # Full but has waitlist — we'll still try to book (API returns waitlist)
-            if is_full and has_waitlist:
-                log(f"  CLASS FULL but has waitlist: {label} — attempting...")
-
-            # No reservation ID means we can't book
-            if not res_id:
-                log(f"  No reservation ID for {label} — cannot book yet")
-                continue
-
-            # Attempt booking via API
-            try:
-                log(f"  Booking: {label} (reservation: {res_id})...")
-                result = book_class(token, res_id)
-                result_status = result.get("status", "UNKNOWN").upper()
-                log(f"  RESULT: {result_status} — {label}")
-                if result_status in ("BOOKED", "WAITLISTED"):
+                if label not in all_booked:
+                    booking_status = my_booking.get("status", "") if isinstance(my_booking, dict) else str(my_booking)
+                    log(f"  Already {booking_status}: {label}")
                     all_booked.append(label)
-            except http_requests.HTTPError as e:
-                log(f"  Booking FAILED (HTTP {e.response.status_code}): {label}")
-                try:
-                    log(f"  Error body: {e.response.text[:300]}")
-                except Exception:
-                    pass
-            except Exception as e:
-                log(f"  Booking FAILED: {label} — {e}")
+                continue
 
-        if not matched_any:
-            log(f"  No target classes ({TARGET_CLASSES}) found in response")
+            if is_full and not has_waitlist:
+                log(f"  FULL: {label}")
+                continue
+
+            if not res_id:
+                continue
+
+            retry_targets.append({"sfid": res_id, "label": label, "item": item})
+
+        if retry_targets:
+            log(f"  Firing {len(retry_targets)} retry booking(s) in parallel")
+            results = fire_all_bookings(token, retry_targets)
+            for label, result in results:
+                status = result.get("status", "UNKNOWN").upper() if isinstance(result, dict) else "UNKNOWN"
+                waitlist_pos = result.get("waitlist_position") if isinstance(result, dict) else None
+                if status in ("BOOKED", "WAITLISTED", "WAITLIST", "CONFIRMED") or waitlist_pos is not None:
+                    all_booked.append(label)
 
         if all_booked:
-            log(f"Successfully booked {len(all_booked)} class(es) — done!")
-            break
+            log(f"Booked {len(all_booked)} class(es) so far")
+            # Check if there's anything left to book
+            if not retry_targets:
+                break
 
         time.sleep(0.3)
 
@@ -417,15 +516,18 @@ def main():
     if (time.time() - loop_start) >= MAX_LOOP_SECONDS:
         log(f"Hard timeout reached after {elapsed}s — stopping")
 
+    if past_deadline():
+        log(f"Deadline {DEADLINE} reached — ending retry loop")
+
     log("=== Session complete ===")
     if all_booked:
-        log(f"Booked {len(all_booked)} class(es) in {cycle} cycle(s):")
+        log(f"Successfully booked/waitlisted {len(all_booked)} class(es):")
         for c in all_booked:
-            log(f"  Booked: {c}")
-    elif cycle == 0:
-        log("No booking cycles ran — script started after the deadline")
+            log(f"  ✓ {c}")
+    elif cycle == 0 and not targets:
+        log("No target classes found to book")
     else:
-        log(f"No classes booked after {cycle} cycle(s) — all slots were taken")
+        log(f"No classes booked after {elapsed}s — all slots were taken")
 
 
 if __name__ == "__main__":
